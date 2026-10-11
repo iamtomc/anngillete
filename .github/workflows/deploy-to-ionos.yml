@@ -1,0 +1,304 @@
+name: Build React + Vite and Deploy to IONOS
+
+on:
+  push:
+    branches: [main, staging]
+  pull_request:
+    branches: [main, staging]
+    types: [opened, reopened, synchronize]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# One shared build branch is published by both production and staging.
+# Serialize runs so two deployments cannot overwrite the build branch concurrently.
+concurrency:
+  group: anngillete-build-deploy
+  cancel-in-progress: false
+
+jobs:
+  build_publish:
+    name: Build and publish static site
+    runs-on: ubuntu-latest
+    outputs:
+      branch: ${{ steps.ctx.outputs.branch }}
+      target_dir: ${{ steps.ctx.outputs.target_dir }}
+      target_env: ${{ steps.ctx.outputs.target_env }}
+      artifact_path: ${{ steps.ctx.outputs.artifact_path }}
+      deploy_enabled: ${{ steps.ctx.outputs.deploy_enabled }}
+      publish_enabled: ${{ steps.ctx.outputs.publish_enabled }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve build and deployment context
+        id: ctx
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            BRANCH="${GITHUB_BASE_REF}"
+            DEPLOY_ENABLED="false"
+            PUBLISH_ENABLED="false"
+          else
+            BRANCH="${GITHUB_REF_NAME}"
+            DEPLOY_ENABLED="true"
+            PUBLISH_ENABLED="true"
+          fi
+
+          case "$BRANCH" in
+            staging)
+              TARGET_DIR="/kunden/homepages/34/d684835060/htdocs/clients/anngillete/staging"
+              TARGET_ENV="staging"
+              ARTIFACT_PATH="staging/current"
+              ;;
+            main)
+              TARGET_DIR="/kunden/homepages/34/d684835060/htdocs/clients/anngillete"
+              TARGET_ENV="production"
+              ARTIFACT_PATH="production/current"
+              ;;
+            *)
+              echo "::error::Unsupported branch: $BRANCH"
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "branch=$BRANCH"
+            echo "target_dir=$TARGET_DIR"
+            echo "target_env=$TARGET_ENV"
+            echo "artifact_path=$ARTIFACT_PATH"
+            echo "deploy_enabled=$DEPLOY_ENABLED"
+            echo "publish_enabled=$PUBLISH_ENABLED"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Print release information
+        shell: bash
+        env:
+          BUILD_BRANCH: ${{ steps.ctx.outputs.branch }}
+          BUILD_ENV: ${{ steps.ctx.outputs.target_env }}
+          ARTIFACT_PATH: ${{ steps.ctx.outputs.artifact_path }}
+        run: |
+          set -euo pipefail
+          VERSION="$(cat VERSION 2>/dev/null || echo "0.0.0")"
+          {
+            echo "### Build summary"
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Event: \`${GITHUB_EVENT_NAME}\`"
+            echo "- Branch: \`${BUILD_BRANCH}\`"
+            echo "- Environment: \`${BUILD_ENV}\`"
+            echo "- Artifact path: \`${ARTIFACT_PATH}\`"
+            echo "- Version: \`${VERSION}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # The committed lockfile has stale/inconsistent integrity entries.
+      # Rebuild it from package.json with a fresh, isolated npm cache.
+      - name: Regenerate npm lockfile
+        shell: bash
+        run: |
+          set -euo pipefail
+          export npm_config_cache="$RUNNER_TEMP/npm-cache"
+          rm -rf "$npm_config_cache"
+          rm -f package-lock.json
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund --prefer-online
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          export npm_config_cache="$RUNNER_TEMP/npm-cache"
+          npm ci --no-audit --no-fund --prefer-online
+
+      - name: Build React + Vite site
+        run: npm run build
+
+      - name: Prepare static deployment directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f dist/index.html || {
+            echo "::error::Vite build output dist/index.html was not created."
+            exit 1
+          }
+
+          rm -rf build
+          mkdir -p build
+          cp -a dist/. build/
+
+      - name: Generate version metadata
+        shell: bash
+        env:
+          BUILD_BRANCH: ${{ steps.ctx.outputs.branch }}
+          BUILD_EVENT: ${{ github.event_name }}
+          BUILD_ARTIFACT_PATH: ${{ steps.ctx.outputs.artifact_path }}
+        run: |
+          set -euo pipefail
+
+          VERSION="$(node -p "require('./package.json').version")"
+          COMMIT="$(git rev-parse --short HEAD)"
+          BUILD_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          export VERSION COMMIT BUILD_DATE
+
+          node <<'NODE'
+          const fs = require('node:fs');
+
+          const metadata = {
+            version: process.env.VERSION,
+            commit: process.env.COMMIT,
+            buildDateUtc: process.env.BUILD_DATE,
+            branch: process.env.BUILD_BRANCH,
+            event: process.env.BUILD_EVENT,
+            buildPath: process.env.BUILD_ARTIFACT_PATH
+          };
+
+          fs.writeFileSync('build/version.json', JSON.stringify(metadata, null, 2) + '\\n');
+          fs.writeFileSync(
+            'build/version.txt',
+            Object.entries(metadata).map(([key, value]) => `${key}=${value}`).join('\\n') + '\\n'
+          );
+          NODE
+
+      - name: Verify build output
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s build/index.html
+          test -s build/version.json
+          test -n "$(find build -mindepth 1 -maxdepth 1 -print -quit)"
+          echo "Verified Vite static output."
+
+      - name: Publish build output to build branch
+        if: steps.ctx.outputs.publish_enabled == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACT_PATH: ${{ steps.ctx.outputs.artifact_path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          WORKTREE="/tmp/build-branch"
+          rm -rf "$WORKTREE"
+
+          if git ls-remote --exit-code --heads "$REPO_URL" build >/dev/null 2>&1; then
+            git clone --depth 1 --branch build "$REPO_URL" "$WORKTREE"
+          else
+            git clone --no-checkout "$REPO_URL" "$WORKTREE"
+            git -C "$WORKTREE" checkout --orphan build
+            git -C "$WORKTREE" rm -rf . >/dev/null 2>&1 || true
+          fi
+
+          cd "$WORKTREE"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          mkdir -p "$(dirname "$ARTIFACT_PATH")"
+          rm -rf "$ARTIFACT_PATH"
+          mkdir -p "$ARTIFACT_PATH"
+          cp -a "$GITHUB_WORKSPACE/build/." "$ARTIFACT_PATH/"
+
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No build-branch changes to commit."
+          else
+            git commit -m "build(${ARTIFACT_PATH}): ${GITHUB_SHA}"
+            git push origin HEAD:build
+          fi
+
+  deploy:
+    name: Deploy to IONOS via rsync over SSH
+    needs: build_publish
+    if: needs.build_publish.outputs.deploy_enabled == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate IONOS SFTP credentials
+        shell: bash
+        env:
+          IONOS_HOST: ${{ secrets.IONOS_HOST }}
+          IONOS_USER: ${{ secrets.IONOS_USER }}
+          IONOS_PASSWORD: ${{ secrets.IONOS_PASSWORD }}
+          IONOS_PORT: ${{ secrets.IONOS_PORT }}
+        run: |
+          set -euo pipefail
+
+          for name in IONOS_HOST IONOS_USER IONOS_PASSWORD; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Missing repository secret: $name"
+              exit 1
+            fi
+          done
+
+          echo "SFTP deployment configured. IONOS_PORT defaults to 22."
+
+      - name: Checkout build branch snapshot
+        uses: actions/checkout@v4
+        with:
+          ref: build
+          path: build-branch
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Prepare deployment source
+        shell: bash
+        env:
+          ARTIFACT_PATH: ${{ needs.build_publish.outputs.artifact_path }}
+          TARGET_ENV: ${{ needs.build_publish.outputs.target_env }}
+          TARGET_DIR: ${{ needs.build_publish.outputs.target_dir }}
+        run: |
+          set -euo pipefail
+          SRC_DIR="build-branch/${ARTIFACT_PATH}"
+
+          if [[ ! -d "$SRC_DIR" ]]; then
+            echo "::error::Build artifact not found: ${SRC_DIR}"
+            exit 1
+          fi
+
+          rm -rf deploy-src
+          mkdir -p deploy-src
+          cp -a "$SRC_DIR/." deploy-src/
+          test -s deploy-src/index.html
+          echo "Deploying ${TARGET_ENV} to ${TARGET_DIR}"
+
+      - name: Install rsync and SSH password authentication
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes rsync sshpass
+
+      - name: Deploy to IONOS via rsync over SSH
+        shell: bash
+        env:
+          IONOS_HOST: ${{ secrets.IONOS_HOST }}
+          IONOS_USER: ${{ secrets.IONOS_USER }}
+          IONOS_PASSWORD: ${{ secrets.IONOS_PASSWORD }}
+          IONOS_PORT: ${{ secrets.IONOS_PORT }}
+          REMOTE_DIR: ${{ needs.build_publish.outputs.target_dir }}
+          TARGET_ENV: ${{ needs.build_publish.outputs.target_env }}
+        run: |
+          set -euo pipefail
+          PORT="${IONOS_PORT:-22}"
+
+          # This matches the working password-authenticated deployment pattern.
+          # StrictHostKeyChecking=no avoids a known-hosts secret, but does not
+          # protect against a server impersonation attack.
+          export SSHPASS="$IONOS_PASSWORD"
+
+          RSYNC_EXCLUDES=()
+          if [[ "$TARGET_ENV" == "production" ]]; then
+            # Do not delete the sibling staging deployment during production sync.
+            RSYNC_EXCLUDES+=(--exclude=/staging/)
+          fi
+
+          rsync --archive --compress --delete "${RSYNC_EXCLUDES[@]}" \
+            -e "sshpass -e ssh -a -x -o StrictHostKeyChecking=no -p $PORT" \
+            deploy-src/ "${IONOS_USER}@${IONOS_HOST}:${REMOTE_DIR}/"
